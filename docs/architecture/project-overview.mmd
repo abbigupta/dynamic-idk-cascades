@@ -1,0 +1,52 @@
+%%{init: {"theme": "neutral", "flowchart": {"curve": "basis", "htmlLabels": true}}}%%
+flowchart TB
+    subgraph source["Data source"]
+        hf["ImageNet-V2 on Hugging Face<br/>matched-frequency · top-images · threshold-0.7"]:::data
+    end
+
+    subgraph preparation["Data and model-output preparation"]
+        helper["dataset.py<br/>optional streaming helper"]:::logic
+        research["dynamic_rf_IDK_Cascade.ipynb<br/>streaming · transforms · inference · cache creation"]:::notebook
+        models["Pretrained classifiers<br/>ResNet-18 · ResNet-34 · ResNet-50 · ResNet-152"]:::model
+    end
+
+    subgraph storage["Reusable artifacts"]
+        train_cache[("Training caches<br/>matched-frequency + top-images<br/>4 models per variant")]:::artifact
+        test_cache[("Test caches<br/>threshold-0.7<br/>4 models")]:::artifact
+        contract["Each .npz cache<br/>probabilities · labels · predictions<br/>times_ms · keys"]:::contract
+    end
+
+    subgraph experiments["Cached-output experiments"]
+        skip["Original RF IDK cascade<br/>no-skip · threshold · RF-skip"]:::logic
+        scheduler["dynamic_parallel_IDK_scheduler.ipynb<br/>heavy RF router + discrete-event scheduler"]:::notebook
+        guide["dynamic_parallel_IDK_scheduler_study_guide.md<br/>line-by-line learning guide"]:::doc
+    end
+
+    subgraph results["Experiment outputs"]
+        reports["Accuracy · routing counts · latency<br/>throughput · utilization · wasted work"]:::output
+    end
+
+    hf --> helper
+    hf --> research
+    helper -. reusable streaming functions .-> research
+    models --> research
+    research --> train_cache
+    research --> test_cache
+    contract --- train_cache
+    contract --- test_cache
+    train_cache --> skip
+    test_cache --> skip
+    train_cache --> scheduler
+    test_cache --> scheduler
+    skip --> reports
+    scheduler --> reports
+    guide -. explains .-> scheduler
+
+    classDef data fill:#dbeafe,stroke:#2563eb,color:#172554,stroke-width:1.5px;
+    classDef model fill:#ede9fe,stroke:#7c3aed,color:#2e1065,stroke-width:1.5px;
+    classDef artifact fill:#dcfce7,stroke:#16a34a,color:#14532d,stroke-width:1.5px;
+    classDef contract fill:#f0fdf4,stroke:#15803d,color:#14532d,stroke-dasharray:5 3;
+    classDef notebook fill:#fef3c7,stroke:#d97706,color:#451a03,stroke-width:1.5px;
+    classDef logic fill:#ffedd5,stroke:#ea580c,color:#431407,stroke-width:1.5px;
+    classDef output fill:#f3f4f6,stroke:#4b5563,color:#111827,stroke-width:1.5px;
+    classDef doc fill:#fce7f3,stroke:#db2777,color:#500724,stroke-width:1.5px;

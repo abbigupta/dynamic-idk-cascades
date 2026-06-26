@@ -1,0 +1,59 @@
+%%{init: {"theme": "neutral", "sequence": {"useMaxWidth": true, "wrap": true, "diagramMarginX": 24, "actorMargin": 36}}}%%
+sequenceDiagram
+    autonumber
+    participant S as Scheduler
+    participant R18 as ResNet-18 worker
+    participant Q34 as ResNet-34 queue
+    participant R34 as ResNet-34 worker
+    participant H as Completion min-heap
+    participant RF as Heavy RF router
+    participant QH as Selected heavy FIFO queue
+    participant R50 as ResNet-50 worker
+    participant R152 as ResNet-152 worker
+    participant M as Metrics
+
+    Note over S,M: Cached-output discrete-event simulation: models do not execute live or share hardware here
+    Note over S,H: Inputs are aligned threshold-0.7 caches plus max_in_flight backpressure
+
+    loop Until all images are finalized and all running events are drained
+        Note over S: Admit only when ResNet-18 is free and unfinished images are below max_in_flight
+        S->>R18: Start next image using cached times_ms
+        S->>Q34: Speculatively enqueue the same image
+
+        alt ResNet-34 worker is free and image is unfinished
+            Q34->>R34: Dispatch queued image
+        else Image was finalized before queue dispatch
+            Q34-->>M: Increment canceled_jobs[ResNet-34]
+        end
+
+        R18-->>H: Push completion event
+        R34-->>H: Push completion event if job started
+        H-->>S: Pop every event at the earliest timestamp
+
+        alt Completion belongs to an already-finalized image
+            S-->>M: Increment wasted_completions[model]
+        else ResNet-18 completed with confidence ≥ threshold
+            S->>M: Finalize with ResNet-18 prediction
+        else ResNet-34 completed with confidence ≥ threshold
+            S->>M: Finalize with ResNet-34 prediction
+        else Both early workers completed as IDK
+            S->>RF: Predict from 18 + 34 confidence, entropy, and margin
+            alt Router class 0
+                RF-->>S: Route to ResNet-50
+                S->>QH: Enqueue for ResNet-50
+                QH->>R50: Start when worker is free
+                R50-->>H: Push heavy completion event
+            else Router class 1
+                RF-->>S: Route to ResNet-152
+                S->>QH: Enqueue for ResNet-152
+                QH->>R152: Start when worker is free
+                R152-->>H: Push heavy completion event
+            end
+            H-->>S: Pop selected heavy-model completion
+            S->>M: Finalize with heavy-model prediction
+        else Only one early IDK result is available
+            Note over S,H: Keep the image unfinished and wait for the other early completion
+        end
+    end
+
+    S->>M: Calculate accuracy, makespan, FPS, latency, exits, executions, utilization, routes, cancellations, and wasted completions
