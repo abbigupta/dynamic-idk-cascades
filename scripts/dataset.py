@@ -26,6 +26,9 @@ def label_from_key(key: str) -> int:
 
 def stream_imagenet_v2_rows(variant: str, max_samples: int | None = None):
     """Yield streamed ImageNet-V2 rows as image/label/key dictionaries."""
+    import warnings
+
+    warnings.filterwarnings("ignore", message="IProgress not found.*")
     from datasets import load_dataset
 
     if variant not in VARIANT_FOLDERS:

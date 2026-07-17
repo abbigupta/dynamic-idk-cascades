@@ -2,7 +2,7 @@
 
 Click "Run Python File" in VS Code, or run:
 
-    .venv/bin/python cache_logits.py
+    .venv/bin/python scripts/cache_logits.py
 
 Every run regenerates all 12 cache files in artifacts/.
 """
@@ -18,7 +18,7 @@ from torchvision import models
 from dataset import stream_imagenet_v2_rows
 
 
-REPO_ROOT = Path(__file__).resolve().parent
+REPO_ROOT = Path(__file__).resolve().parents[1]
 
 VARIANTS = {
     "matched-frequency": "matched",

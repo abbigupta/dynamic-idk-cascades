@@ -12,3 +12,4 @@ data/
 artifacts/
 runs/
 .DS_Store
+ImageNet-V2 DataSet/*.tar.gz
