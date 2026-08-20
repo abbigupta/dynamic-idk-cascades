@@ -1,0 +1,420 @@
+% Drop-in draft for the unfinished sections of the RTSS paper.
+% Expected packages: graphicx (for \resizebox) and cite.
+
+\begin{abstract}
+Classifier cascades reduce average inference cost by accepting easy inputs at
+small models and forwarding uncertain inputs to larger models.  Their usual
+sequential execution, however, leaves processors idle and limits throughput
+when inputs arrive continuously.  This paper presents a dynamic parallel IDK
+(``I don't know'') cascade for image classification.  A lightweight model
+handles every input first.  For an uncertain input, a learned router selects
+one of two downstream models from the upstream model's confidence, entropy, and
+top-two probability margin.  A scheduler coordinates model workers through an
+asymmetric doubly linked queue, permits safe work stealing, and bounds the
+number of in-flight inputs.  On ImageNet-V2, a Random-Forest skip decision
+reduces cached sequential compute time by 5.9\% without changing top-1
+accuracy at the reported precision.  In controlled cache replay, two in-flight
+inputs increase throughput from 57.94 to 96.28 images/s while increasing mean
+latency from 17.26 to 20.51 ms.  A live Apple-M1 implementation sustains a
+30-frame/s input stream, whereas a 60-frame/s configuration is overloaded and
+accumulates backlog.  These results show that learned routing and bounded
+parallelism can improve average throughput, but also that admission rate and
+shared-accelerator contention must be modeled explicitly for real-time use.
+\end{abstract}
+
+\begin{IEEEkeywords}
+classifier cascades, real-time inference, dynamic scheduling, work stealing,
+edge computing
+\end{IEEEkeywords}
+
+\section{Introduction}
+\label{sec:introduction}
+
+Modern image classifiers trade increasing execution cost for increasing
+accuracy.  This trade-off is undesirable for continuous perception: many
+frames are easy enough for a small model, but the hardest frames still require
+a larger model.  An IDK classifier exposes this distinction by returning a
+class only when its confidence exceeds a threshold and returning IDK
+otherwise.  An IDK cascade runs increasingly capable classifiers until one
+returns a class \cite{wang2018idk}.  It therefore avoids unnecessary work on
+easy inputs without modifying the underlying pretrained models.
+
+Sequential cascades save computation but expose little parallelism.  While a
+large model processes one difficult input, the small model could already
+process later inputs.  Simply assigning one model to each worker is also
+insufficient: the data-dependent route creates unequal queues, accelerator
+workers contend for a shared device, and unbounded admission converts a small
+service-rate deficit into rapidly growing latency.  The scheduling problem is
+therefore not only which classifier should run, but also when each input should
+be admitted and which idle worker may execute it.
+
+We study a dynamic parallel cascade built from pretrained ResNet-18,
+ResNet-34, ResNet-50, and ResNet-152 classifiers.  The design combines
+confidence-based early acceptance, a learned downstream router, bounded
+in-flight execution, and asymmetric work stealing.  The paper makes three
+contributions:
+
+\begin{itemize}
+    \item a low-overhead routing policy using confidence, entropy, and margin
+    rather than confidence alone;
+    \item a multiprocessing scheduler that preserves input--result association
+    while allowing different models to process different inputs concurrently;
+    and
+    \item an evaluation that separates cached policy replay from live
+    end-to-end execution and explicitly measures overload under fixed-rate
+    camera arrivals.
+\end{itemize}
+
+The results demonstrate a throughput--latency trade-off rather than an
+unqualified speedup.  Bounded concurrency substantially improves throughput;
+unbounded concurrency achieves slightly higher throughput but produces
+second-scale queueing delay.  The fixed-rate experiments further show that
+completion throughput alone is insufficient: backlog slope and drain time are
+needed to determine whether a real-time stream is sustainable.
+
+\section{Background and Related Work}
+\label{sec:background}
+
+\subsection{IDK and Early-Exit Classification}
+
+IDK cascades compose independently trained models and stop after the first
+sufficiently confident answer \cite{wang2018idk}.  This is related to
+early-exit networks such as BranchyNet \cite{teerapittayanon2016branchynet},
+but the unit of composition differs.  Early-exit networks add intermediate
+heads to one network and generally require joint training.  Our system instead
+uses unmodified pretrained models, allowing model placement and scheduling to
+change without retraining the classifiers.
+
+Recent edge experiments likewise arrange pretrained classifiers from
+lightweight to complex and use confidence thresholds to reduce average
+inference time \cite{ratul2026accuracy}.  Our work differs by learning the
+branch between downstream models and by evaluating queue stability under a
+continuous periodic input stream.
+
+Confidence is convenient but imperfect.  Modern neural networks may be
+miscalibrated, so a large softmax probability does not necessarily equal the
+true probability of correctness \cite{guo2017calibration}.  We therefore treat
+the confidence threshold as an experimental policy parameter, report accuracy
+separately from the non-IDK rate, and use entropy and margin as additional
+router features.
+
+\subsection{Scheduling Classifier Cascades}
+
+Prior real-time analysis orders IDK classifiers to minimize expected duration,
+optionally subject to a deadline \cite{baruah2023ordering}.  Later work models
+arbitrary statistical dependence between classifiers and synthesizes static
+multiprocessor list schedules \cite{abdelzaher2023scheduling}.  These models
+provide an important offline baseline.  Our focus is complementary: a stream
+of independent inputs is present simultaneously, observed service times vary,
+and logically separate workers share one physical accelerator.  The scheduler
+therefore makes online dispatch decisions and limits admission to control
+queueing delay.
+
+Work stealing is a standard way to move work from a busy worker to an idle one
+\cite{blumofe1999workstealing}.  In this cascade, stealing is intentionally
+asymmetric.  The larger downstream model may take a job assigned to the smaller
+downstream model when its own side of the queue is empty.  The reverse steal is
+disabled because a sample routed to the larger model is not assumed to be
+classifiable by the smaller one.
+
+\subsection{Limitations of Existing Approaches}
+
+Three limitations motivate the proposed design.  First, a strictly sequential
+cascade cannot overlap different inputs.  Second, a static multiprocessor
+allocation does not react to route imbalance or runtime variation.  Third,
+maximizing throughput without admission control can hide overload behind an
+ever-growing queue.  Our design addresses these limitations operationally; it
+does not claim a hard worst-case response-time guarantee.
+
+\section{Models Under Comparison}
+\label{sec:comparisons}
+
+We compare five configurations.  All use ImageNet-pretrained residual networks
+\cite{he2016resnet}; the exact model set and confidence threshold are reported
+with every result.
+
+\subsection{Sequential Learned-Skip Cascade}
+
+The single-process baseline executes ResNet-18 first.  If it returns IDK, a
+Random Forest predicts whether ResNet-34 should run or be skipped in favor of
+the final heavy model.  All inference and routing operations execute
+sequentially on one accelerator.
+
+\subsection{Pipelined Sequential Cascade}
+
+The pipelined baseline assigns ResNet-18, ResNet-34, ResNet-50, and ResNet-152
+to separate logical workers while preserving the fixed cascade order.  A model
+forwards an input only after returning IDK.  Different inputs may occupy
+different stages concurrently, but an input cannot bypass a stage.
+
+\subsection{Parallel Three-Model Cascades}
+
+ResNet-18 processes every input.  A confident result terminates immediately;
+otherwise, a learned router sends the input to ResNet-34 or to one heavy model.
+We evaluate both ResNet-50 and ResNet-152 as the heavy alternative.  The two
+downstream workers share a doubly linked waiting queue and the heavy worker may
+steal a ResNet-34 job when safe.
+
+\subsection{Parallel Four-Model Cascade}
+
+ResNet-18 and ResNet-34 are started speculatively on separate logical workers.
+If ResNet-18 succeeds, queued ResNet-34 work is canceled when possible and a
+late result is ignored.  If both early models are uncertain, the router uses
+ResNet-34's output features to choose ResNet-50 or ResNet-152.  This
+configuration exposes more parallelism at the cost of speculative work and
+greater contention.
+
+\section{Experimental Setup}
+\label{sec:setup}
+
+\subsection{Dataset}
+
+We use the three 10,000-image ImageNet-V2 test sets introduced by Recht
+\emph{et al.} \cite{recht2019imagenetv2}.  Each contains ten images for each of
+the 1,000 ImageNet classes.  The \emph{top-images} set contains the candidates
+with the highest selection frequency, the \emph{threshold-0.7} set samples
+images selected by at least 70\% of annotators, and the
+\emph{matched-frequency} set matches the selection-frequency distribution of
+the original ImageNet validation set.  The artifact keys confirm that the
+three local sets are disjoint.  Router training uses matched-frequency and
+top-images (20,000 images total); all reported policy and runtime tests use the
+held-out threshold-0.7 set (10,000 images).
+
+Images are resized to 256 pixels, center-cropped to $224\times224$, converted
+to tensors, and normalized with the ImageNet statistics associated with the
+pretrained weights.  Inference uses batch size one for the live experiments.
+
+\subsection{Hardware and Software}
+
+Experiments run on an Apple M1 MacBook Pro with four performance cores, four
+efficiency cores, and 16 GB unified memory.  Classifiers execute through
+PyTorch \cite{paszke2019pytorch} using the Metal Performance Shaders (MPS)
+backend.  Each classifier has a separate Python process and queue, but all MPS
+processes share the same physical accelerator; a ``worker'' therefore denotes
+a logical execution context, not a dedicated GPU.  The inspected environment
+uses Python 3.14, PyTorch 2.12, torchvision 0.27, NumPy 2.4, and scikit-learn
+1.9.
+
+\subsection{Router Training}
+
+For probability vector $p$, the router feature vector is
+\begin{equation}
+  x(p) = \left[\max_i p_i,\; -\sum_i p_i\log(p_i+10^{-12}),\;
+  p_{(1)}-p_{(2)}\right],
+\end{equation}
+where $p_{(1)}$ and $p_{(2)}$ are the largest and second-largest
+probabilities.  Training includes only inputs for which the upstream model is
+IDK and at least one downstream model reaches the confidence threshold.  When
+both downstream models qualify, the smaller model is preferred.
+
+The SVM uses an RBF kernel, $C=2$, automatic gamma scaling, and balanced class
+weights \cite{cortes1995svm}.  Random Forest and Extra Trees use 100 trees,
+maximum depth six, minimum leaf size 20, balanced class weights, and random
+seed 42 \cite{breiman2001randomforests,geurts2006extratrees}.  The learned-skip
+baseline instead uses 50 Random-Forest trees, maximum depth four, and minimum
+leaf size 40.
+
+\subsection{Metrics}
+
+Top-1 accuracy is the fraction of all inputs whose final class equals the
+ground-truth class.  Throughput is completed inputs divided by wall-clock run
+time.  End-to-end latency is completion time minus admission time; we report
+its mean and 95th percentile where recorded.  For fixed-rate input, we also
+report the maximum number of unfinished frames, the backlog slope after a 10\%
+warm-up interval, and drain time after the final arrival.  A run keeps up when
+the realized arrival rate is within 5\% of its target and backlog growth is no
+greater than $\max(0.5,0.02r)$ frames/s for target rate $r$.
+
+\section{Results}
+\label{sec:results}
+
+\subsection{Learned Skip Decision}
+
+Table~\ref{tab:skip} isolates the skip policy with cached logits and timing.
+All three policies produce the same top-1 accuracy to three decimals.  The
+Random-Forest policy skips ResNet-34 on 3,880 of the 6,278 inputs rejected by
+ResNet-18 and reduces mean cached work from 18.33 to 17.25 ms per image, a
+5.9\% reduction.  Its skip-decision accuracy is 69\%, compared with 38\% for a
+fixed 0.3 skip threshold.
+
+\begin{table}[t]
+\caption{Cached skip-policy evaluation (R18/R34/R152, $\tau=0.9$, 10,000 images).}
+\label{tab:skip}
+\centering
+\small
+\begin{tabular}{lrrrr}
+\hline
+Policy & Accuracy & Work (ms/img) & B accepted & B skipped \\
+\hline
+No skip & 0.789 & 18.33 & 1,179 & 0 \\
+Threshold & 0.789 & 17.80 & 1,130 & 1,277 \\
+Random Forest & 0.789 & 17.25 & 807 & 3,880 \\
+\hline
+\end{tabular}
+\end{table}
+
+\subsection{Bounded Parallelism}
+
+In controlled cached replay, the sequential RF baseline reaches 57.94
+images/s with 17.26-ms mean latency.  Limiting the scheduler to two in-flight
+inputs reaches 96.28 images/s (1.66$\times$) with 20.51-ms mean and 47.94-ms
+95th-percentile latency.  Raising the limit to four reaches 104.84 images/s,
+but mean latency increases to 37.64 ms.  With no limit, throughput saturates at
+105.05 images/s while mean latency grows to 13.31 s and the 95th percentile to
+57.55 s.  Thus, the useful operating point is bounded by latency, not by peak
+throughput.
+
+\subsection{Live Worker Results}
+
+Table~\ref{tab:live} reports live preprocessing, routing, queueing, and MPS
+inference.  These rows characterize implemented configurations; they are not
+all causal comparisons because the model set and threshold vary.  The
+three-model SVM configuration has the highest observed live throughput
+(54.08 images/s) and low mean latency (27.60 ms), but also lower accuracy than
+the four-model configuration.  The four-model SVM recovers 77.48\% accuracy at
+42.21 images/s.  Its speculative ResNet-34 path cancels 1,900 jobs before
+execution and ignores 1,682 completed or late jobs after ResNet-18 succeeds,
+quantifying the cost of speculation.
+
+\begin{table*}[t]
+\caption{Live end-to-end results on threshold-0.7 ImageNet-V2.}
+\label{tab:live}
+\centering
+\small
+\begin{tabular}{llrrrrr}
+\hline
+Configuration & Models & $\tau$ & Accuracy (\%) & Throughput & Mean latency (ms) & Wall time (s) \\
+\hline
+Sequential RF skip & R18/R34/R50 & 0.9 & 77.49 & 25.87 & 36.56 & 386.53 \\
+Pipelined sequential & R18/R34/R50/R152 & 0.7 & 76.84 & 36.30 & 8,606.36 & 275.51 \\
+Parallel RF route & R18/R34/R152 & 0.7 & 77.18 & 41.15 & 3,339.89 & 243.02 \\
+Parallel SVM route & R18/R34/R50 & 0.7 & 73.18 & 54.08 & 27.60 & 184.92 \\
+Parallel four-model SVM & R18/R34/R50/R152 & 0.9 & 77.48 & 42.21 & 114.68 & 236.88 \\
+\hline
+\end{tabular}
+\end{table*}
+
+The very large mean latencies of the pipelined sequential and ResNet-152 RF
+rows are queueing effects: their service rate falls below their effective
+admission rate.  They should not be interpreted as single-image model
+execution times.  This distinction explains why a run can show tens of
+milliseconds of per-model execution yet seconds of end-to-end latency.
+
+\subsection{Router Comparison}
+
+Table~\ref{tab:router} evaluates all routers from the same cached training and
+test features for the three-model 0.7-threshold configuration.  Router label
+accuracy measures agreement with the confidence-derived routing target, not
+ground-truth image correctness.  Random Forest best reproduces that target,
+whereas Extra Trees gives the highest final cascade accuracy.  This mismatch
+shows that a routing objective based only on whether a model crosses a
+confidence threshold is not identical to the system objective.  Future router
+training should optimize correctness and cost directly.
+
+\begin{table}[t]
+\caption{Cached router comparison ($\tau=0.7$).}
+\label{tab:router}
+\centering
+\small
+\begin{tabular}{lrrr}
+\hline
+Router & Route acc. (\%) & Cascade acc. (\%) & Work (ms/img) \\
+\hline
+SVM & 72.94 & 73.52 & 6.27 \\
+Random Forest & 79.53 & 73.04 & 6.06 \\
+Extra Trees & 70.65 & 73.88 & 6.35 \\
+\hline
+\end{tabular}
+\end{table}
+
+\subsection{Scheduler Behavior}
+
+The in-flight limit is the main latency control.  At a limit of two, workers
+overlap useful work without building a long queue.  Higher limits keep the
+bottleneck worker busy but add waiting time almost linearly.  Work stealing is
+beneficial only when the heavy worker is idle and the stolen sample was
+originally assigned to the smaller downstream model.  No reverse stealing is
+allowed.  Every result carries its input index, so out-of-order completion does
+not change prediction--label association.
+
+\section{Fixed-Rate Camera Experiment}
+\label{sec:camera}
+
+\subsection{Scenario and Method}
+
+The offline workload always has another image available and therefore measures
+maximum completion rate.  A camera instead produces periodic arrivals.  We
+admit frames from an absolute monotonic clock, process every admitted frame,
+and do not drop frames.  This experiment measures whether the queue remains
+stable, not only how quickly the system drains after input ends.
+
+\subsection{Results}
+
+Table~\ref{tab:camera} shows two recorded operating points.  The 30-frame/s
+R18/R34/R50 configuration keeps up: realized arrivals and completions both
+equal approximately 30 frames/s, backlog has negative long-run slope, and only
+17 ms is needed to drain after the last arrival.  Its transient maximum of 103
+unfinished frames and 235-ms 95th-percentile latency show that keeping up on
+average does not imply a per-frame 33.3-ms deadline.
+
+The 60-frame/s R18/R34/R152 configuration does not keep up.  It completes 43.11
+frames/s, has 1,776 unfinished frames at the final arrival, and requires 65.32
+s to drain.  Mean latency reaches 19.13 s.  The two rows use different heavy
+models and are therefore operating points rather than a controlled rate-only
+comparison; nevertheless, the 60-frame/s result directly demonstrates
+overload for that deployed configuration.
+
+\begin{table*}[t]
+\caption{Fixed-rate camera results ($\tau=0.7$, 10,000 frames; R18 and R34 are common to both rows).}
+\label{tab:camera}
+\centering
+\small
+\begin{tabular}{llrrrrrrrl}
+\hline
+Rate & Heavy & Acc. (\%) & In (fps) & Out (fps) & Mean (ms) & P95 (ms) & Backlog & Drain (s) & Stable \\
+\hline
+30 & R50 & 73.18 & 30.000 & 30.001 & 115.57 & 234.66 & 2 & 0.017 & yes \\
+60 & R152 & 76.42 & 60.000 & 43.110 & 19,131.79 & 63,104.73 & 1,776 & 65.316 & no \\
+\hline
+\end{tabular}
+\end{table*}
+
+\section{Threats to Validity and Limitations}
+\label{sec:limitations}
+
+The experiments use one Apple M1 system, and multiple MPS processes contend
+for one integrated GPU.  Results may differ on devices with dedicated
+accelerators or true concurrent kernels.  Each configuration is represented by
+one recorded run, so run-to-run variance and confidence intervals are not yet
+available.  The study reports observed response times rather than WCET bounds
+and consequently does not establish hard real-time schedulability.
+
+Thresholds and heavy models differ across some configurations.  We report
+these parameters explicitly and avoid attributing their combined effect to the
+scheduler alone.  Router training and testing use disjoint ImageNet-V2
+variants, but all variants follow the same collection process; evaluation on
+additional datasets is needed.  Finally, no frame-dropping or backpressure
+policy is applied.  The overload experiment therefore measures queue growth
+under lossless processing, not the behavior of a production camera pipeline
+that may discard stale frames.
+
+\section{Conclusion and Future Work}
+\label{sec:conclusion}
+
+This paper presented a dynamic parallel IDK cascade that combines learned
+routing, logical model workers, a partitioned doubly linked queue, asymmetric
+work stealing, and bounded admission.  The experiments support three
+conclusions.  First, a learned skip policy can remove intermediate-model work
+without reducing measured accuracy.  Second, limited overlap yields a large
+throughput gain, whereas unbounded overlap converts bottleneck utilization into
+unacceptable queueing delay.  Third, a camera-rate claim must be supported by
+backlog stability: the tested system sustains 30 frames/s but not the recorded
+60-frame/s configuration.
+
+Future work will calibrate model confidence on a held-out calibration split,
+train routers against a joint correctness--latency objective, and repeat every
+configuration across multiple devices and seeds.  A practical real-time
+version should add deadline-aware admission, stale-frame dropping, and explicit
+backpressure.  Profiling shared-accelerator interference and incorporating it
+into response-time analysis are also necessary steps toward hard real-time
+guarantees.
