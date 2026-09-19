@@ -1,7 +1,8 @@
 # Dynamic IDK Cascades
 
-Research workspace for Random Forest IDK routing and dynamic parallel
-classifier scheduling on ImageNet-V2.
+[📄 **Read Full Paper (PDF)**](./Dynamic_IDK_Cascades_WIP-1.pdf)
+
+---
 
 ## Files
 
